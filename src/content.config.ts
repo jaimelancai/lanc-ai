@@ -4,7 +4,7 @@ import { glob } from 'astro/loaders';
 // The "articles" collection. Markdown files live in src/content/articles/.
 // The filename (without extension) becomes the article's URL slug.
 const articles = defineCollection({
-  loader: glob({ pattern: '**/*.md', base: './src/content/articles' }),
+  loader: glob({ pattern: '**/*.{md,mdx}', base: './src/content/articles' }),
   schema: z.object({
     title: z.string(),
     description: z.string(),

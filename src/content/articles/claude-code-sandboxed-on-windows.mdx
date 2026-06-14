@@ -1,0 +1,132 @@
+---
+title: "Running Claude Code Sandboxed on Windows (Without Breaking Unity)"
+description: "Claude Code's sandbox hangs for two minutes at a time on Windows project files. Here's the kernel-level reason why, the approaches that don't work, and the WSL + Samba setup that does — packaged as an open-source installer."
+pubDate: 2026-06-14
+tags: ["claude-code", "agentic-ai", "gamedev", "wsl", "windows", "unity"]
+draft: true
+---
+
+import YouTube from '../../components/YouTube.astro';
+
+If you run Claude Code on macOS or Linux, sandboxing just works. The agent runs shell commands in an isolated environment, you get the safety benefit, and you never think about it. On Windows, it's a different story — and if your project lives on a Windows drive while Claude Code runs in WSL, you'll hit freezes of roughly two minutes at a time that make the tool nearly unusable.
+
+I spent a while diagnosing why, ruled out every obvious fix, and ended up with a setup that runs Claude Code fully sandboxed at native speed while Unity, Unreal, and Visual Studio keep working on the same files. I packaged it as an open-source installer called [ClaudeCodeWSB](https://github.com/jaimelancai/ClaudeCodeWSB). This article is the written companion to a three-part video series: the concepts, the Linux-side setup, and the Windows-side setup.
+
+## Why sandboxing on Windows is harder
+
+Claude Code's sandbox isolates the commands the agent runs from the rest of your system. On Linux this is built on bubblewrap, seccomp, and namespaces. On macOS it uses Seatbelt. Both are OS-native and work out of the box.
+
+Windows has no equivalent primitive, so the standard recommendation is to run Claude Code inside WSL2, where the Linux sandboxing tools are available. That works perfectly — right up until your project lives on a Windows drive.
+
+The first video walks through the four scenarios and why most of them break:
+
+<YouTube videoId="j5GPD52rDXQ" title="Sandboxing Claude Code on Windows: The 4 Scenarios" />
+
+## The problem, at the kernel level
+
+Here's the first thing that makes this so frustrating to diagnose: **it doesn't happen every time.** The same command, on the same project, in the same setup, will run fine ten times and then freeze for two minutes on the eleventh. There's no clean reproduction — it depends on the interaction between WSL2's filesystem bridge (9P) and the sandbox's extra filesystem operations, and that interaction is timing-sensitive enough that it sometimes slips through and sometimes stalls. That intermittency is exactly why the setup is so unstable in practice: you can't trust it, because you never know whether the next command will hang.
+
+When it *does* hang — Claude Code running in WSL2 with the sandbox enabled, against a project on a Windows path (`/mnt/c/...`, `/mnt/d/...`) — it freezes for about 100 seconds at a time. Catching the process mid-stall tells the story:
+
+```bash
+$ cat /proc/<pid>/status | grep State
+State:  D (disk sleep)      # uninterruptible — can't even be killed
+$ cat /proc/<pid>/wchan
+p9_client_rpc               # blocked in a 9P filesystem call to Windows
+```
+
+The process is stuck inside the kernel, waiting on the **9P protocol** — the bridge WSL2 uses to expose Windows drives to Linux. It's waiting for the Windows side to answer a filesystem request, and on the bad attempts that answer takes ~100 seconds to arrive instead of milliseconds.
+
+Disable the sandbox and the hangs vanish entirely. The sandbox adds filesystem operations per command (namespace setup, bind mounts, extra `stat` calls), and multiplying those across the already-slow Windows bridge occasionally pushes a call past a breaking point. Neither piece is reliably broken on its own — a plain command usually completes, and the sandbox is fine on Linux-native paths. It's the *combination* of the 9P bridge and the sandbox's I/O overhead that's fragile, and because it's a timing race rather than a hard failure, it surfaces unpredictably. The sandbox is the trigger; the slow, variable bridge is the underlying cause.
+
+I benchmarked a metadata-heavy walk over a real Unity project (54,609 files):
+
+| Location | wall time | user CPU |
+|---|---|---|
+| `/mnt/d/` (Windows drive via 9P) | 2m 15s | 44s |
+| `~/dev/` (WSL ext4) | 1m 30s | 4s |
+| Docker bind mount of the same folder | 2m 11s | 47s |
+
+The Windows-drive path burns **11× the user-mode CPU** for identical work — the fingerprint of antivirus filter drivers intercepting every file operation. And excluding the folder from the antivirus changed nothing: exclusions skip content scanning, but the filter drivers stay in the I/O path regardless.
+
+## What doesn't work
+
+Each of these was tested, not assumed:
+
+- **Antivirus folder exclusions** — no measurable effect.
+- **Docker Desktop bind mounts** — same underlying file-sharing mechanism, identical hangs.
+- **Mounting Windows over SMB from inside WSL** — same slowness; the bottleneck is below the protocol layer (NTFS plus filter drivers).
+- **Opening the project from `\\wsl.localhost\` in Unity** — Unity refuses: *"The project is on case sensitive file system."*
+- **`vmIdleTimeout` tweaks** — relevant to a different sub-problem, and didn't behave as documented anyway (more on that below).
+- **Disabling the sandbox** — works, but gives up the only reason to use WSL.
+
+## What does work: reverse the direction
+
+Instead of Linux reaching across a slow bridge into Windows files, put the files on Linux and let Windows reach across a *fast, correct* bridge into them.
+
+```
+WSL ext4: ~/dev/project  ──►  Claude Code reads natively (sandboxed, fast)
+        └─► Samba ──► Windows maps it as Z:  ──►  Unity / Unreal / Visual Studio
+```
+
+Both sides see the same bytes. There are no copies and nothing to sync.
+
+Two non-obvious Samba settings make Windows tooling happy, both found the hard way:
+
+- `case sensitive = no` — satisfies Unity's case-sensitivity check (Samba does case-insensitive lookups even though ext4 underneath is case-sensitive).
+- `acl allow execute always = yes` — lets Windows execute DLLs and EXEs from the share. Without it, Unity's Burst compiler and `vswhere.exe` fail with "Access denied."
+
+There's one more wrinkle. WSL terminates a distro within seconds of the last attached `wsl.exe` session closing — even with Samba running inside it, and regardless of `vmIdleTimeout` (I tested values up to 24 hours; the distro still died in seconds). When the distro dies, the share dies with it. The fix is to keep one hidden `wsl.exe` process running `sleep infinity` to hold the VM alive during your session. That single detail took longer to pin down than anything else.
+
+## Installing it
+
+ClaudeCodeWSB automates all of the above with two installers. Full details are in the [repository README](https://github.com/jaimelancai/ClaudeCodeWSB), and the tutorial videos below walk through each side.
+
+### Linux side
+
+Clone into your WSL home directory (not a `/mnt/` path — that fails because NTFS doesn't support Linux file modes, which is the whole problem in miniature):
+
+```bash
+cd ~
+git clone https://github.com/jaimelancai/ClaudeCodeWSB.git
+cd ClaudeCodeWSB/wsl
+chmod +x install.sh
+./install.sh
+```
+
+The installer sets up Samba, Claude Code, and the sandbox dependencies, asks where your projects should live, and configures the share with the Unity-compatible options. Here's the full walkthrough:
+
+<YouTube videoId="uHeBV3ACPu4" title="ClaudeCodeWSB: Linux-side install" />
+
+### Windows side
+
+```powershell
+cd ClaudeCodeWSB\windows
+powershell -ExecutionPolicy Bypass -File .\install-windows.ps1
+```
+
+This maps the share to a drive letter you pick, saves your Samba credentials encrypted, sets up the keepalive, and creates a scheduled task that remounts everything at login. The Windows-side walkthrough:
+
+<YouTube videoId="0s4RSoA3T8s" title="ClaudeCodeWSB: Windows-side install" />
+
+## Using it day to day
+
+- **Claude Code:** inside WSL, `cd ~/dev/your-project && claude`. Sandbox on, full speed.
+- **Unity / Unreal / Visual Studio:** open the project from `Z:\your-project` like any local project.
+- Edits from either side are instantly visible to the other — they're the same files.
+
+I've verified the full Unity loop on this setup: the project opens from the mapped drive, Burst compiles, scripts open in Visual Studio, the solution rebuilds, and the Unity MCP integration works.
+
+## The honest limitations
+
+- Ubuntu 24.04 only (tested; others may work).
+- The WSL IP changes between reboots, so the mapping script rediscovers it each login.
+- The mapped drive depends on the WSL VM being alive — `wsl --shutdown` or a Windows update can drop it, and there's a one-click "Remount" shortcut for that.
+
+## Why I built it this way
+
+This started as a personal annoyance and turned into a small study in how agentic AI changes the shape of this kind of work. Diagnosing a kernel-level filesystem stall, testing six dead ends, and packaging the result into installers that handle partial failures and a dozen PowerShell 5.1 quirks — that's a lot of surface area. Working through it with Claude Code, in the very WSL environment the project sets up, was its own argument for the tool.
+
+The full technical narrative — every benchmark, every ruled-out approach, and the PowerShell landmines — is in the project's [ARCHITECTURE.md](https://github.com/jaimelancai/ClaudeCodeWSB/blob/main/docs/ARCHITECTURE.md). If you try the installer and something breaks, the [TROUBLESHOOTING.md](https://github.com/jaimelancai/ClaudeCodeWSB/blob/main/docs/TROUBLESHOOTING.md) covers the issues I hit during testing.
+
+If you're running Claude Code on Windows for game or software development, I hope it saves you the week it cost me.

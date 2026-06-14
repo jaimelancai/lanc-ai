@@ -1,5 +1,6 @@
 // @ts-check
 import { defineConfig } from 'astro/config';
+import mdx from '@astrojs/mdx';
 import sitemap from '@astrojs/sitemap';
 import tailwindcss from '@tailwindcss/vite';
 
@@ -9,7 +10,9 @@ export default defineConfig({
   site: 'https://lanc.ai',
   // Static output — required for Cloudflare Pages. Do not switch to 'server'.
   output: 'static',
-  integrations: [sitemap()],
+  // mdx() enables <YouTube> (and other components) inline in article bodies.
+  // It also applies the markdown.shikiConfig below to code in .mdx files.
+  integrations: [mdx(), sitemap()],
   markdown: {
     shikiConfig: {
       // Dark theme for code blocks; matches the site's dark aesthetic.

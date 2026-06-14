@@ -13,7 +13,7 @@ export const AVATAR_SRC = '/avatar.png';
 
 // Social / external links. Replace the placeholders with real URLs.
 export const SOCIAL_LINKS = {
-  github: 'https://github.com/your-handle',
-  youtube: 'https://youtube.com/@your-handle',
-  linkedin: 'https://www.linkedin.com/in/your-handle',
+  github: 'https://github.com/jaimelancai',
+  youtube: 'https://youtube.com/@lancaidev',
+  linkedin: 'https://www.linkedin.com/in/jlanchares',
 };

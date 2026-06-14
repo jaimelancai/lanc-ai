@@ -1,0 +1,27 @@
+---
+// Responsive, privacy-friendly YouTube embed.
+// Uses youtube-nocookie.com and lazy loading. Renders nothing without a videoId.
+interface Props {
+  videoId?: string;
+  title?: string;
+}
+
+const { videoId, title = 'YouTube video player' } = Astro.props;
+---
+
+{
+  videoId && (
+    <div class="relative aspect-video w-full overflow-hidden rounded-lg border border-neutral-800 bg-neutral-900">
+      <iframe
+        class="absolute inset-0 h-full w-full"
+        src={`https://www.youtube-nocookie.com/embed/${videoId}`}
+        title={title}
+        loading="lazy"
+        frameborder="0"
+        allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+        referrerpolicy="strict-origin-when-cross-origin"
+        allowfullscreen
+      />
+    </div>
+  )
+}

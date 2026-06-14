@@ -1,0 +1,27 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import ArticleCard from '../../components/ArticleCard.astro';
+import { getArticles } from '../../lib/articles';
+
+const articles = await getArticles();
+---
+
+<BaseLayout
+  title="Articles"
+  description="Writing on agentic AI, game development, and software engineering."
+>
+  <h1 class="text-2xl font-bold text-neutral-100">Articles</h1>
+  <p class="mt-2 text-neutral-400">
+    Notes on agentic AI, game development, and building software with Claude Code.
+  </p>
+
+  <div class="mt-8">
+    {
+      articles.length > 0 ? (
+        articles.map((article) => <ArticleCard article={article} />)
+      ) : (
+        <p class="py-6 text-neutral-400">No articles yet — check back soon.</p>
+      )
+    }
+  </div>
+</BaseLayout>

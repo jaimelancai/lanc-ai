@@ -1,0 +1,37 @@
+---
+import { SOCIAL_LINKS, SITE_TITLE } from '../consts';
+
+const year = new Date().getFullYear();
+
+const links = [
+  { href: SOCIAL_LINKS.github, label: 'GitHub' },
+  { href: SOCIAL_LINKS.youtube, label: 'YouTube' },
+  { href: SOCIAL_LINKS.linkedin, label: 'LinkedIn' },
+  { href: '/rss.xml', label: 'RSS' },
+];
+---
+
+<footer class="mt-16 border-t border-neutral-800">
+  <div
+    class="mx-auto flex max-w-3xl flex-col items-center justify-between gap-4 px-4 py-8 text-sm text-neutral-500 sm:flex-row"
+  >
+    <p>&copy; {year} {SITE_TITLE}</p>
+    <nav aria-label="Social and feeds">
+      <ul class="flex items-center gap-5">
+        {
+          links.map((link) => (
+            <li>
+              <a
+                href={link.href}
+                class="hover:text-sky-400"
+                rel={link.href.startsWith('http') ? 'me noopener' : undefined}
+              >
+                {link.label}
+              </a>
+            </li>
+          ))
+        }
+      </ul>
+    </nav>
+  </div>
+</footer>

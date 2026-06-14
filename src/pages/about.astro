@@ -1,0 +1,37 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import { SOCIAL_LINKS, AUTHOR_NAME } from '../consts';
+---
+
+<BaseLayout
+  title="About"
+  description={`About ${AUTHOR_NAME} — background, expertise, and links.`}
+>
+  <div class="prose prose-invert prose-a:text-sky-400">
+    <h1>About</h1>
+
+    <p>
+      <em>Placeholder — replace this with your real bio.</em>
+    </p>
+
+    <h2>Background</h2>
+    <p>
+      A short paragraph about who you are, your career so far, and what you’re
+      focused on right now.
+    </p>
+
+    <h2>Expertise</h2>
+    <ul>
+      <li>Game development &amp; technical direction</li>
+      <li>Agentic AI and developer tooling</li>
+      <li>Software engineering &amp; architecture</li>
+    </ul>
+
+    <h2>Elsewhere</h2>
+    <ul>
+      <li><a href={SOCIAL_LINKS.github} rel="me noopener">GitHub</a></li>
+      <li><a href={SOCIAL_LINKS.linkedin} rel="me noopener">LinkedIn</a></li>
+      <li><a href={SOCIAL_LINKS.youtube} rel="me noopener">YouTube</a></li>
+    </ul>
+  </div>
+</BaseLayout>

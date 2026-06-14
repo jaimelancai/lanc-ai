@@ -1,0 +1,67 @@
+---
+import { render } from 'astro:content';
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import FormattedDate from '../../components/FormattedDate.astro';
+import YouTube from '../../components/YouTube.astro';
+import { getArticles, type Article } from '../../lib/articles';
+
+export async function getStaticPaths() {
+  const articles = await getArticles();
+  return articles.map((article) => ({
+    params: { slug: article.id },
+    props: { article },
+  }));
+}
+
+interface Props {
+  article: Article;
+}
+
+const { article } = Astro.props;
+const { title, description, pubDate, updatedDate, tags, youtube } = article.data;
+const { Content } = await render(article);
+---
+
+<BaseLayout title={title} description={description} ogType="article">
+  <a href="/" class="text-sm text-neutral-400 hover:text-sky-400">&larr; Back to home</a>
+
+  <article class="mt-6">
+    <header class="border-b border-neutral-800 pb-6">
+      <h1 class="text-3xl font-bold text-neutral-100">{title}</h1>
+      <div class="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-neutral-500">
+        <FormattedDate date={pubDate} />
+        {updatedDate && (
+          <span>· Updated <FormattedDate date={updatedDate} /></span>
+        )}
+      </div>
+      {
+        tags.length > 0 && (
+          <ul class="mt-4 flex flex-wrap gap-2">
+            {tags.map((tag) => (
+              <li class="rounded-full border border-neutral-800 bg-neutral-900 px-2.5 py-0.5 text-xs text-neutral-400">
+                {tag}
+              </li>
+            ))}
+          </ul>
+        )
+      }
+    </header>
+
+    {youtube && (
+      <div class="mt-6">
+        <YouTube videoId={youtube} title={title} />
+      </div>
+    )}
+
+    <!-- `prose` caps the body measure at ~65ch for comfortable long-form reading. -->
+    <div
+      class="prose prose-invert mt-8 prose-headings:scroll-mt-20 prose-a:text-sky-400 prose-pre:border prose-pre:border-neutral-800 prose-pre:bg-neutral-900"
+    >
+      <Content />
+    </div>
+  </article>
+
+  <div class="mt-12 border-t border-neutral-800 pt-6">
+    <a href="/" class="text-sm text-neutral-400 hover:text-sky-400">&larr; Back to home</a>
+  </div>
+</BaseLayout>

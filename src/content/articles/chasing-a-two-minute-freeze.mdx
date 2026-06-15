@@ -1,0 +1,131 @@
+---
+title: "Chasing a Two-Minute Freeze: Debugging a Kernel-Level WSL Stall"
+description: "Claude Code kept freezing for two minutes at a time on Windows — but only sometimes. The hunt went from antivirus settings down to uninterruptible kernel sleep and the 9P filesystem bridge. Here's how I tracked it down, and the six fixes that didn't work before the one that did."
+pubDate: 2026-06-15
+tags: ["claude-code", "agentic-ai", "wsl", "windows", "debugging", "linux"]
+draft: false
+---
+
+import YouTube from '../../components/YouTube.astro';
+
+Some bugs announce themselves cleanly: same input, same failure, every time. You bisect, you find it, you fix it. This was not one of those bugs.
+
+What I had was Claude Code freezing for roughly two minutes at a time while working on a Unity project — but only *sometimes*. The same command, the same files, the same machine: it would run fine ten times and then lock up solid on the eleventh. No error, no pattern I could see, no way to force it. Just an agent that occasionally went catatonic for two minutes and then carried on as if nothing had happened.
+
+This is the story of tracking that down. It ends with [ClaudeCodeWSB](https://github.com/jaimelancai/ClaudeCodeWSB), the open-source tool I built around the fix — but the fix is the least interesting part. The interesting part is the path to it, and the six reasonable-sounding things that turned out to be wrong.
+
+## The setup, and why it should have been fine
+
+I run Claude Code with sandboxing enabled, because letting an agent run shell commands without isolation is not something I want to do on my main machine. On Windows there's no native sandbox, so the accepted approach is to run Claude Code inside WSL2, where the Linux sandboxing primitives (bubblewrap, seccomp, namespaces) are available. My Unity project lived on a Windows drive — `D:\` — which WSL exposes to Linux at `/mnt/d/`.
+
+This is a completely ordinary setup. It's what the documentation points you toward. And most of the time, it worked.
+
+## First guesses (all wrong)
+
+My first three hypotheses were the obvious ones, and I want to be honest that I chased each of them before getting anywhere useful.
+
+**"It's the antivirus."** Windows machines run real-time scanning, and a Unity project is tens of thousands of files. Surely the AV was chewing on file access. I added the project folder to the exclusion list. No change — still froze, just as often.
+
+**"It's Claude Code."** Maybe the agent was doing something pathological. But disabling the sandbox made the freezes vanish entirely, and a sandbox isn't supposed to cause two-minute hangs. That told me the sandbox was *involved*, but "the sandbox is buggy" didn't fit — it works fine for thousands of people on Linux and macOS.
+
+**"WSL is just slow on Windows files."** Everyone knows `/mnt/` access in WSL is slower than native. But slow is not the same as *frozen*. Slow is a tax on every operation; this was a process locking up completely and then recovering. Different shape of problem.
+
+Three plausible guesses, three dead ends. Time to stop guessing and look.
+
+## Getting to the kernel
+
+The breakthrough was catching the process while it was actually frozen and asking the kernel what it was doing. From a second WSL terminal, with the hung process's PID:
+
+```bash
+$ cat /proc/<pid>/status | grep State
+State:  D (disk sleep)
+```
+
+`D` state. Uninterruptible sleep. This is a specific and telling thing: a process in `D` is blocked inside a kernel call, waiting on I/O, and it cannot be interrupted or even killed until that call returns. It's not spinning, not deadlocked in userspace — it's parked in the kernel waiting for something to come back.
+
+Waiting for *what*, though? That's in `wchan` — the "wait channel," the kernel function the process is sleeping in:
+
+```bash
+$ cat /proc/<pid>/wchan
+p9_client_rpc
+```
+
+There it was. `p9_client_rpc` — the 9P protocol client. 9P is the network filesystem protocol WSL2 uses to bridge between Linux and Windows drives. When Linux touches a file under `/mnt/`, that request is marshalled over 9P to the Windows side, which does the actual work and answers back. The process was stuck mid-RPC, waiting for Windows to respond to a filesystem request — and on the bad runs, that response was taking ~100 seconds instead of microseconds.
+
+This reframed everything. The problem wasn't the antivirus, or Claude Code, or "WSL is slow." It was a specific, identifiable stall in the filesystem bridge, and the sandbox was the thing tipping it over the edge.
+
+## Quantifying it
+
+A diagnosis you can't measure is just a better-informed guess. I wanted numbers, so I ran a deliberately metadata-heavy workload — walk every file in the Unity project and `stat` it — across three locations and timed it:
+
+```bash
+time find . -type f -exec stat {} \; > /dev/null
+```
+
+On a real Unity project of 54,609 files:
+
+| Location | wall time | user CPU |
+|---|---|---|
+| `/mnt/d/` (Windows drive via 9P) | 2m 15s | 44s |
+| `~/dev/` (WSL ext4, native) | 1m 30s | 4s |
+| Docker Desktop bind mount of the same folder | 2m 11s | 47s |
+
+The wall-time difference is notable, but the **user CPU** column is the smoking gun: the Windows-drive path burned **eleven times** the user-mode CPU for byte-identical work. That's not disk speed — that's per-operation processing happening somewhere in the stack. Running `fltmc filters` on the Windows side showed what: antivirus filter drivers (Avira's, plus a Bitdefender driver) sitting in the I/O path, intercepting every single file operation.
+
+And here's why my very first guess failed: I had *excluded* the folder from scanning, but exclusions only skip the content *scan*. The filter drivers stay registered in the I/O path regardless — they still intercept and inspect every operation, they just don't deep-scan the contents. The overhead I was measuring was the interception itself, not the scanning. No exclusion list can remove it.
+
+So the full picture: every filesystem operation crosses a slow 9P bridge, gets intercepted by filter drivers on the Windows end, and the sandbox multiplies the *number* of those operations (namespace setup, bind mounts, extra `stat` calls per command). Most of the time the pile-up clears in time. Occasionally — a timing race, not a hard failure — a call blows past a threshold and the process parks in `D` state for a full minute and a half. That's the intermittency: it was never a deterministic bug, it was a race condition in disguise.
+
+## Six things that didn't work
+
+Once I understood the mechanism, the fix seemed obvious: get the files off the slow bridge. But "obvious" and "easy" are different words, and I went through six approaches before landing on one that actually held up. I'm listing them all because each dead end taught me something, and because if you're fighting this, you'll be tempted by several of them too.
+
+**1. Antivirus exclusions.** Covered above — no effect, because filter drivers don't leave the I/O path.
+
+**2. Docker Desktop bind mounts.** Surely a "proper" container mount would be faster than raw `/mnt/`? No — Docker Desktop on Windows uses the same underlying file-sharing mechanism. The benchmark was identical, and the hang reproduced inside the container exactly as before.
+
+**3. SMB from inside WSL.** What if I mounted the Windows folder over SMB instead of using the 9P bridge? Same slowness. The bottleneck isn't the protocol on top — it's NTFS plus the filter drivers underneath, and swapping the transport layer doesn't change what's below it.
+
+**4. Opening the project from `\\wsl.localhost\` in Unity.** This flips the problem: put the files on Linux ext4, and have *Windows* reach into WSL. Promising — except Unity refused to open the project at all: *"The project is on case sensitive file system."* WSL's ext4 is case-sensitive; Unity's asset database assumes case-insensitivity and won't proceed.
+
+**5. ext4 `casefold`.** Linux ext4 supports a per-directory case-insensitivity feature that would, in theory, satisfy Unity. Except the default WSL ext4 image is built *without* the casefold feature flag compiled in, so enabling it would mean rebuilding the filesystem — too invasive to ask anyone to do.
+
+**6. `vmIdleTimeout`.** This one belongs to a sub-problem I hit later (keeping the WSL VM alive), but it deserves a place in the graveyard: the documented setting for controlling WSL's idle shutdown simply didn't behave as documented on my system. I tested values up to 24 hours; the distro still terminated within *seconds* of the last session closing. More on that below.
+
+## The fix: reverse the flow
+
+The insight that worked was hiding inside dead end #4. The *direction* was right — files on Linux, Windows reaching in — it was only Unity's case-sensitivity check that blocked it. So instead of giving up on the direction, solve the case-sensitivity a different way: don't expose ext4 directly, expose it through **Samba**, and let Samba handle the case-insensitivity at the protocol layer.
+
+```
+WSL ext4: ~/dev/project  →  Claude Code reads it natively (sandboxed, fast)
+        └─ Samba ─→ Windows mounts it as a drive  →  Unity / Unreal / Visual Studio
+```
+
+The files live on the fast, native Linux filesystem. Claude Code's sandbox operates on them at full speed with no bridge in the path. Samba serves the same directory back to Windows as a normal mapped drive, so Unity and the rest of the Windows toolchain see an ordinary case-insensitive network drive. Both sides look at the same bytes — no copies, nothing to sync.
+
+The 9P bridge is simply no longer in the hot path. Problem dissolved rather than solved.
+
+<YouTube videoId="j5GPD52rDXQ" title="Sandboxing Claude Code on Windows: the four scenarios" />
+
+## The two surprises in the implementation
+
+Reversing the flow was the idea. Making it actually work surfaced two things I didn't see coming.
+
+**Samba needed two non-obvious directives.** Getting the share to mount was easy; getting Unity to be *happy* with it took two specific settings, both found by hitting the failure and working backwards:
+
+- `case sensitive = no` — Samba does case-insensitive name resolution at the protocol layer, which satisfies Unity even though ext4 underneath is still case-sensitive. This is the piece that makes the whole approach viable.
+- `acl allow execute always = yes` — without it, Windows can't *execute* binaries from the share, and Unity's Burst compiler and `vswhere.exe` fail with cryptic "Access denied" errors. Took a while to connect those failures to a Samba permission setting.
+
+**WSL kills the VM the instant you stop looking at it.** This was the more surprising one. The whole scheme depends on the WSL distro staying alive so Samba keeps serving. But I found the distro shutting down within *seconds* of closing my terminal — taking the share, and my mapped drive, with it. I assumed `vmIdleTimeout` would fix it. It didn't, at any value. After more testing than I'd like to admit, the actual rule turned out to be: WSL keeps a distro alive only while an attached `wsl.exe` process exists. Services running *inside* the distro — even a busy Samba daemon — don't count. The fix is almost silly: keep one hidden `wsl.exe` process running `sleep infinity` in the background to hold the VM open. That single detail took longer to pin down than the entire kernel diagnosis.
+
+## What it left me with
+
+A few things stuck with me from this one.
+
+The first is how far the real cause was from the first symptom. "Claude Code freezes sometimes" and "a 9P RPC parks the process in uninterruptible kernel sleep because filter drivers inflate per-operation latency past a timing threshold" are the same bug, described at two ends of a long chain. Intermittent problems are intermittent because they're races, and races hide their cause behind layers — you can't reason your way from the symptom; you have to instrument your way down to where the process is actually blocked.
+
+The second is the value of a graveyard. Six approaches failed, and writing down *why* each failed was as useful as the fix itself — both for not re-trying them, and because the reasons mapped out the real shape of the constraint until the solution was almost forced.
+
+And the third, more reflective: I did most of this diagnosis working alongside Claude Code itself — including, eventually, building the tool *inside* the very WSL environment the tool sets up. There's something fitting about debugging an agentic-AI tool's filesystem behavior with the agent as a partner in the investigation, then packaging the result so the next person doesn't lose the week I did.
+
+If you want the tool rather than the story, the [ClaudeCodeWSB repository](https://github.com/jaimelancai/ClaudeCodeWSB) has the installers and the [full architecture write-up](https://github.com/jaimelancai/ClaudeCodeWSB/blob/main/docs/ARCHITECTURE.md). And if you just want to get Claude Code running sandboxed on Windows without reading any of this, [the companion guide](/articles/claude-code-sandboxed-on-windows) walks through the setup directly.

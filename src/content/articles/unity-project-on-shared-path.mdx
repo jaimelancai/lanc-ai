@@ -1,0 +1,63 @@
+---
+title: "Creating a Unity Project for the ClaudeCodeWSB Shared Drive"
+description: "Creating a Unity project directly on the WSL Samba share corrupts the asset database during import. The fix is simple once you know it: create on a local disk, then move the finished project to the share. Here's the working flow and why it's necessary."
+pubDate: 2026-06-16
+tags: ["claude-code", "agentic-ai", "gamedev", "unity", "wsl", "windows"]
+draft: true
+---
+
+import YouTube from '../../components/YouTube.astro';
+
+If you're using [ClaudeCodeWSB](https://github.com/jaimelancai/ClaudeCodeWSB) to run Claude Code sandboxed on Windows, your Unity projects live on a Samba share backed by the WSL Linux filesystem, mounted as a drive like `Z:`. Working on a project there is reliable. But there's one operation that isn't: **creating a brand-new project directly on the share.** Do that, and Unity's import will fail in a spectacular cascade of errors.
+
+This is a short guide to the workflow that avoids it, and a quick explanation of why it's needed.
+
+<YouTube videoId="mjG0_pYSWto" title="Creating a Unity project for the ClaudeCodeWSB shared drive" />
+
+## What goes wrong if you create on the share
+
+Create a new project straight onto `Z:` and you'll see something like this during the initial import:
+
+```
+Import Error Code:(5)
+Message: Build asset version error: projectsettings/projectsettings.asset does not exit in SourceAssetDB
+Has ADB guid but no valid Hash for asset '...'
+```
+
+...followed by dozens of compiler errors about missing types — `CS0246` and `CS0234` for InputSystem, TestRunner, and other packages ("The type or namespace name 'PointerEventData' could not be found", and so on).
+
+Those compiler errors are a red herring. The real failure is in the lines about `SourceAssetDB` and "no valid Hash": Unity's **asset database is being corrupted as it's built**. Everything else is downstream of that.
+
+## Why it happens
+
+Creating a project is the most write-intensive thing Unity does. It imports thousands of package files and builds its asset database in a rapid, highly concurrent burst — writing a file, recording its hash, reading it back, all at speed.
+
+Over SMB, writes are cached and may be reordered or delayed. So Unity records an asset's hash and then reads back data that hasn't been consistently flushed yet, and the hash check fails. Multiply that across thousands of files during import and the asset database ends up corrupted before the project ever finishes opening.
+
+I tried forcing consistency with Samba's `strict sync = yes` and `sync always = yes` — the options that make the server flush writes instead of caching them. They didn't fix it (the corruption still happened) and they made all file access dramatically slower. So that's a dead end; don't waste time on it.
+
+The good news: this only affects **creation**. Once a project is imported, working on it from the share — opening scenes, editing scripts, compiling, entering Play mode — is reliable, because that's mostly stable reads plus modest incremental writes, not a concurrent import storm.
+
+## The working flow: create local, move to share
+
+The fix is to do the write-heavy import where I/O is reliable (a local disk), then move the finished project to the share.
+
+1. **Create the project on a local Windows path.** Somewhere like `C:\dev\MyProject`, not the share.
+2. **Open it once and let Unity finish.** Wait for the import to complete and the `Library/` folder to be fully built. Confirm the Console is clean — no import or compiler errors.
+3. **Close Unity.**
+4. **Move the entire project folder to the share** — into your `~/dev` location on the WSL side, which is what the share serves (e.g. `Z:\MyProject`). **Include the `Library/` folder in the move.**
+5. **Reopen from the share.** Because the asset database is already built and valid, Unity just loads it.
+
+That's it. From here on, you develop normally from the mapped drive, with Claude Code working on the same files from the WSL side.
+
+## One important detail: bring `Library/` with you
+
+Move the **whole** project, including `Library/`. If you move everything *except* `Library/`, Unity will rebuild it the first time you open the project from the share — which re-triggers the exact concurrent-import storm that corrupts the database. Bringing `Library/` along means there's nothing heavy left to build on the share.
+
+Done this way, opening the moved project is clean — no import errors, and no warnings. (If you instead create the project directly on the share and reopen it, you'll also see "immutable files were changed" warnings stacked on top of the import errors — another symptom of the same broken path. The create-local-then-move flow avoids all of it.)
+
+## Why bother at all?
+
+It's a fair question: if you have to create the project on a local disk anyway, why put it on the share?
+
+Because creation is a one-time event, and *everything after that* is the win. Once the project lives on the share, Claude Code runs against it sandboxed and at native speed on the Linux side, while Unity, Visual Studio, and the rest of your Windows tools work on the very same files. The one-time local-create step is a small tax for getting a sandboxed AI agent and your full Windows toolchain operating on one shared project. The full rationale for the architecture is in the [ClaudeCodeWSB write-up](https://github.com/jaimelancai/ClaudeCodeWSB/blob/main/docs/ARCHITECTURE.md), and if you haven't set up the environment yet, [start here](/articles/claude-code-sandboxed-on-windows).

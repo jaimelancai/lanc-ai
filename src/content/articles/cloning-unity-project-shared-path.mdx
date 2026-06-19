@@ -1,0 +1,91 @@
+---
+title: "Cloning a Unity Project onto the ClaudeCodeWSB Shared Drive"
+description: "Cloning an existing Unity repo onto the WSL Samba share hits three obstacles: git ownership checks, asset-database corruption on first import, and phantom modified files from missing Git LFS. Here's the working flow and the fix for each."
+pubDate: 2026-06-18
+tags: ["claude-code", "agentic-ai", "gamedev", "unity", "wsl", "windows", "git"]
+draft: false
+---
+
+import YouTube from '../../components/YouTube.astro';
+
+If you already have a Unity project in a git repository and want to work on it with [ClaudeCodeWSB](https://github.com/jaimelancai/ClaudeCodeWSB), you'll clone it onto the shared drive (`Z:`) backed by the WSL Linux filesystem. Doing that surfaces three separate obstacles — none obvious, all fixable. This is the working flow and the fix for each.
+
+If you're creating a project from scratch rather than cloning one, see the companion guide: [Creating a Unity Project for the Shared Drive](/articles/unity-project-on-shared-path). The core lesson is the same; the obstacles differ.
+
+<YouTube videoId="g-AO_vE2JPg" title="Cloning a Unity project onto the ClaudeCodeWSB shared drive" />
+
+## Obstacle 1: git refuses the repo ("dubious ownership")
+
+Run a git command in the cloned project on the share and git may refuse:
+
+```
+fatal: detected dubious ownership in repository at '//172.23.x.x/dev/your-project'
+'//172.23.x.x/dev/your-project' is owned by: 'S-1-5-21-...-1000'
+but the current user is: 'S-1-5-21-...-1001'
+```
+
+**Cause.** The files live on the WSL ext4 filesystem, owned by your Linux user. Accessed from Windows through the SMB share, they appear owned by a different account than the Windows user running git. Since CVE-2022-24765, git refuses to operate on repositories it thinks belong to someone else — a safety measure against malicious repos on shared mounts.
+
+**Fix.** Tell git to trust the path. The simplest durable option, fine on a single-user dev machine:
+
+```powershell
+git config --global --add safe.directory '*'
+```
+
+You can scope it to the specific share instead of `*`, but the WSL IP changes between reboots, so a pinned path goes stale. The wildcard avoids that. (If you prefer the tight scope, re-add the current path at login from the same script that maps the drive.)
+
+## Obstacle 2: the first open corrupts the asset database
+
+A cloned Unity repo excludes the `Library/` folder (it's generated and git-ignored). So the first time you open the cloned project, Unity has to **build `Library/` from scratch** — importing thousands of files in a concurrent burst. Done over SMB, that write storm corrupts the asset database, exactly as it does when creating a project on the share. You'll see a flood of `CS0246`/`CS0234` compiler errors plus the real cause:
+
+```
+Import Error Code:(5)
+Message: Build asset version error: projectsettings/projectsettings.asset does not exit in SourceAssetDB
+Has ADB guid but no valid Hash for asset '...'
+Could not create asset from Assets/Art/...png: File could not be read
+```
+
+**Fix — do the import on a local disk, then move to the share:**
+
+1. Clone the repo to a **local Windows path** (e.g. `C:\dev\your-project`).
+2. Open it in Unity once; let it import and build `Library/`. Confirm the Console is clean.
+3. Close Unity.
+4. Move the entire project — **including `Library/`** — onto the share (`Z:`, i.e. your `~/dev` location).
+5. Reopen from the share. The asset database is already built, so Unity just loads it.
+
+This is the same "import locally, move to share" rule as creating a project: the share is reliable for *working on* an imported project, not for the initial import.
+
+## Obstacle 3: phantom "modified" files (Git LFS)
+
+After all that, you might find git reporting files as modified that you never touched — typically art assets:
+
+```
+modified:   Assets/Art/Gems/element_blue_diamond.png
+```
+
+...but only from one side. Run `git status` in WSL and the files show modified; run it from Windows git and the tree is clean. Same files, two answers.
+
+**Cause.** The project tracks those binaries with **Git LFS**. Git LFS replaces large files in the repo with small text pointers and stores the real content separately. Windows git has LFS installed, so it hashes the pointer (clean). If your WSL environment is missing `git-lfs`, WSL git hashes the raw binary instead of the pointer, computes a different hash, and reports the file modified. The two clients disagree because one runs the LFS filter and the other doesn't — nothing to do with the share.
+
+You can confirm it directly: `git hash-object <file>` returns different hashes on each side until both have LFS.
+
+**Fix.** Install and initialize Git LFS in WSL:
+
+```bash
+sudo apt-get install git-lfs
+git lfs install
+cd ~/dev/your-project
+git lfs pull
+```
+
+After this, both git clients run the same filter and agree. (Recent versions of the ClaudeCodeWSB installer set up `git-lfs` for you, so a freshly-installed environment won't hit this.)
+
+## The rules, summarized
+
+Working with a cloned Unity project on the ClaudeCodeWSB share comes down to three habits:
+
+1. **Trust the repo path once** with `git config --global --add safe.directory '*'`.
+2. **Import on a local disk, then move to the share** — never let Unity's first import run over SMB.
+3. **Make sure git-lfs is installed in WSL** (the installer handles this now) so LFS-tracked assets behave consistently.
+
+Once the project is imported and on the share, day-to-day work is reliable: Claude Code operates on it sandboxed from the WSL side, and Unity and your Windows tools use the same files through the mapped drive. For the full picture of why the architecture works this way, see the [ClaudeCodeWSB write-up](https://github.com/jaimelancai/ClaudeCodeWSB), and if you haven't set up the environment yet, [start here](/articles/claude-code-sandboxed-on-windows).
